@@ -1,0 +1,35 @@
+name: Frontend
+
+on:
+  push:
+    # branches: [develop, main]
+    # paths:
+    #   - 'packages/frontend/**'
+    #   - 'docker/Dockerfile.frontend'
+    #   - '**.tfvars'
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'packages/frontend/**'
+      - 'docker/Dockerfile.frontend'
+      - '**.tfvars'
+  workflow_dispatch:
+
+jobs:
+  frontend-merge-deploy:
+    if: (github.event_name == 'push' && github.ref_name == 'main') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main')
+    uses: vutruongduc/common-workflows/.github/workflows/merge-deploy.yaml@main
+    with:
+      module: frontend
+      argocd_url: g1-cd.sipher.gg
+      namespace: funki-info-page
+      argocd_project: funki-info-page
+      aws_role: arn:aws:iam::127395585441:role/github-action-role
+      infra_bucket_state: development-127395585441-infra-state
+      service_account_path: .deploy/dev/serviceaccount
+      deploy_path: .deploy/dev
+    secrets:
+      PAT: ${{ secrets.PAT }}
+      ARGOCD_SECRET: ${{ secrets.ARGO_G1_CD }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+

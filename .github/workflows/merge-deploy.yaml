@@ -1,0 +1,191 @@
+name: Merge code and deploy
+
+on:
+  workflow_call:
+    inputs:
+      module:
+        description: "Microservice name. (ex: backend)"
+        required: true
+        type: string
+      argocd_url:
+        description: "Argocd URL. (ex: g1-cd.sipher.gg)"
+        required: true
+        type: string
+      aws_role:
+        description: "AWS Role. (ex: arn:aws:iam::127395585441:role/github-action-role)"
+        required: true
+        type: string
+      namespace:
+        description: "Argocd namespace. (ex: io-portal)"
+        required: true
+        type: string
+      cluster_name:
+        description: "k8s cluster name. (ex: in-cluster)"
+        type: string
+        default: in-cluster
+      argocd_project:
+        description: "Argocd project. (ex: io-portal)"
+        required: true
+        type: string
+      infra_bucket_state:
+        description: "Terraform infra bucket state. (ex: development-127395585441-infra-state)"
+        required: true
+        type: string
+      infra_bucket_region:
+        description: "Infra bucket region. (ex: ap-southeast-1)"
+        type: string
+        default: ap-southeast-1
+      service_account_path:
+        description: "Service account path. (ex: .deploy/dev/serviceaccount)"
+        required: true
+        type: string
+        default: .deploy/dev/serviceaccount
+      deploy_path:
+        description: "Deploy path. (ex: .deploy/dev)"
+        type: string
+        default: .deploy/dev
+      channel_id:
+        description: "Channel id to send notificate. (ex: loyalty-admin-portal-cicd)"
+        type: string
+        default: ''
+
+    secrets:
+      PAT:
+        description: "Personal access token for git"
+        required: true
+      ARGOCD_SECRET:
+        description: "Argocd develop password"
+        required: false
+      docker_build_args:
+        required: false
+      NPM_TOKEN:
+        required: false
+      webhook:
+        description: "SLACK_WEBHOOK_URL"
+        required: false
+env:
+  module: ${{ inputs.module }}
+  argocd_user: admin
+  git_repo: ${{ github.server_url }}/${{ github.repository }}.git
+  SLACK_WEBHOOK_URL: ${{ secrets.webhook }}
+
+jobs:
+  build_push_deploy_image:
+    runs-on: self-hosted
+    container:
+      image: asia.gcr.io/g1-mmo/ci:gameserver-1.0.5
+
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Declare variables
+        id: vars
+        shell: bash
+        run: |
+          echo "sha_short=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
+          echo "module_name=$(echo "${{ env.module }}" | sed 's/\./-/g' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "argocd_app_name=$(echo "${{ github.repository }}-${{ env.module }}" | sed 's/\//-/g' | sed 's/\./-/g' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "image_tag=$(echo "${{ github.ref_name }}" | sed 's/\//-/g' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role }}
+          aws-region: ap-southeast-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR Repository
+        uses: int128/create-ecr-repository-action@v1
+        with:
+          repository: ${{ github.repository }}/${{ steps.vars.outputs.module_name }}
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ github.repository }}/${{ steps.vars.outputs.module_name }}
+          IMAGE_TAG: ${{github.ref_name}}-${{ steps.vars.outputs.sha_short }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ${{ secrets.docker_build_args }} --build-arg NPM_TOKEN=${{ secrets.NPM_TOKEN }} -f docker/Dockerfile.${{ inputs.module }} .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image_repository=${ECR_REGISTRY}/${ECR_REPOSITORY}" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          docker rmi $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Trigger to Argocd
+        shell: bash
+        run: |
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/download/v2.2.5/argocd-linux-amd64 && chmod +x /usr/local/bin/argocd
+          argocd login ${{ inputs.argocd_url }} --username ${{ env.argocd_user }} --password ${{ secrets.ARGOCD_SECRET }} --grpc-web
+          if [[ $(argocd app get ${{ steps.vars.outputs.argocd_app_name }}) ]]
+          then
+              echo "${{ steps.vars.outputs.argocd_app_name }} existing"
+              argocd app set ${{ steps.vars.outputs.argocd_app_name }} -p sipher-chart.image.repository=${{ steps.build.outputs.image_repository}} -p sipher-chart.image.tag=${{ steps.build.outputs.image_tag}} --grpc-web
+          else
+              echo "${{ steps.vars.outputs.argocd_app_name }} NOT existing"
+              argocd app create ${{ steps.vars.outputs.argocd_app_name }} --repo ${{ env.git_repo }} --dest-namespace ${{ inputs.namespace }} --dest-name ${{ inputs.cluster_name }} --project ${{ inputs.argocd_project }} --path ${{ inputs.deploy_path }} --revision ${{ github.ref_name }} --values ${{ env.module }}.yaml -p sipher-chart.image.repository=${{ steps.build.outputs.image_repository}} -p sipher-chart.image.tag=${{ steps.build.outputs.image_tag}} --release-name ${{ inputs.module }} --grpc-web
+              argocd app sync ${{ steps.vars.outputs.argocd_app_name }} --prune --grpc-web
+          fi
+
+      - name: Notification
+        if: ${{ !cancelled() }} && (inputs.channel_id != '' && env.SLACK_WEBHOOK_URL != '')
+        continue-on-error: true
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          job_name: build_and_trigger_deploy_${{inputs.module}}
+          author_name: ""
+          fields: repo,message,commit,author,eventName,ref,workflow,job,pullRequest
+
+
+  service-account-tfapply:
+    if: inputs.module == 'backend'
+    runs-on: self-hosted
+    container:
+      image: asia.gcr.io/g1-mmo/ci:terraform-v0.0.1
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Terraform Setup
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.2.6
+
+      - name: Configure AWS Credentials for Develop Environment
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role }}
+          aws-region: ap-southeast-1
+
+      - name: Terraform Apply for Environment
+        run: |
+          if [ ! -d "${{ inputs.service_account_path }}" ]; then
+            echo "Ignore config service-account"
+            exit 0
+          fi
+
+          git config --global url."https://oauth2:${{ secrets.PAT }}@github.com".insteadOf "ssh://git@github.com"
+          aws sts assume-role --role-arn ${{ inputs.aws_role }} --role-session-name "GithubActionSession" > assume-role-output.txt
+          export AWS_ACCESS_KEY_ID=$(cat assume-role-output.txt | jq -r ".Credentials.AccessKeyId")
+          export AWS_SECRET_ACCESS_KEY=$(cat assume-role-output.txt | jq -r ".Credentials.SecretAccessKey")
+          export AWS_SECURITY_TOKEN=$(cat assume-role-output.txt | jq -r ".Credentials.SessionToken")
+          export AWS_SESSION_TOKEN=$(cat assume-role-output.txt | jq -r ".Credentials.SessionToken")
+          cd ${{ inputs.service_account_path }}
+          terraform init -upgrade -backend-config='bucket=${{ inputs.infra_bucket_state }}' -backend-config='key=${{ github.repository }}/${{ env.module }}/terraform.tfstate' -backend-config='region=${{ inputs.infra_bucket_region }}' -backend-config="encrypt=true"
+          terraform apply -var-file=${{ env.module }}.tfvars -auto-approve
